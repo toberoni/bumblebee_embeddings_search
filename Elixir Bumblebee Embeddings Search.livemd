@@ -1,0 +1,344 @@
+# Bumblebee Embeddings Image Search
+
+## Section
+
+```elixir
+Mix.install([
+  {:bumblebee, "~> 0.5.0"},
+  {:nx, "~> 0.7.0"},
+  {:exla, "~> 0.7.0"},
+  {:axon, "~> 0.6.1"},
+  {:kino, "~> 0.12.0"},
+  {:hnswlib, "~> 0.1.5"},
+  {:image, "~> 0.48"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+This step-by-step guide is aimed at beginners with no or little knowledge how to use AI in real world web applications.
+
+It helps if you are familiar with embeddings and basic linear algebra, hovever I will explain all concepts the we need along the way.
+
+## What we build
+
+We'll build an AI image search with the help of of the open source CLIP model by OpenAI. It's well integrated with Bumblebee, so once you know the process it will be straightforward to implement such a search in your own apps.
+
+### What are embeddings?
+
+This model encodes text and images as embeddings. You can think of them as arrows that point in a certain direction.
+
+IMAGE OF VEVCOTRS
+
+1. Imagine we encode strings/images of dogs and cats based on 2 dimensions: their size and their species.
+2. These criteria allow us to distinguish most occurences of these animals and represent them as arrows (vectors).
+
+In reality, embeddings are not just simple arrows (vectors) in a 3-dimensional space but are abstract objects in higher dimensions (impossible to visualize for humans). Our CLIP model uses 512 dimension to distinguish features of text and image embeddings.
+
+### Vector databases
+
+Embeddings are usually stored as arrays of floats in a database. This makes them very fast for query-related tasks. For our image search to work, we'll have to go through 2 steps:
+
+1. First we encode images
+2. If we have an index of image embeddings we can compare them to a string embedding in order to get a list of similar pictures.
+
+I will also show you how to store the embeddings in a vector database (we'll use [HNSWLib](https://github.com/elixir-nx/hnswlib)) so we can search through the entries and fetch images that are similar to our search query.
+
+<!-- livebook:{"break_markdown":true} -->
+
+**Note:** I recommend to clone the Github repository with 40 prepared images.
+
+```bash
+git clone https://github.com/toberoni/bumblebee_embeddings_search
+```
+
+You can also use your own images instead, just put them in an /images folder and you should be good to go.
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## The CLIP model
+
+In order to build our image search, we will use OpenAI's [CLIP](https://huggingface.co/openai/clip-vit-base-patch32) model from a HuggingFace repository.
+
+The model was pretrained on pairs of images & image captions. CLIP is able to link a text embedding e.g. a search query like "a princess on a horse", to an image embedding and tell us how similar they are. This is exactly what we need for our image search.
+
+We use the CLIP Base model because it's smaller & the encoding process is a lot faster than the more accurate CLIP Large. The latter should work too, so feel free to switch to the bigger model if you don't mind the longer encoding time.
+
+**Note:** The following will download around 600MB:
+
+```elixir
+model = "openai/clip-vit-base-patch32"
+model_dimension = 512
+
+## or try the bigger, more accurate model:
+# model = "openai/clip-vit-large-patch14"
+# model_dimension = 768
+# batch_size = 2
+
+# use CLIP text encoder
+{:ok, clip_text} =
+  Bumblebee.load_model({:hf, model},
+    module: Bumblebee.Text.ClipText,
+    architecture: :for_embedding
+  )
+
+# create a Nx Serving to encode text strings
+{:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, model})
+text_serving = Bumblebee.Text.text_embedding(clip_text, tokenizer, output_attribute: :embedding)
+```
+
+First, we load the CLIP text encoder with Bumblebee and specify how to compute our embeddings with a (Nx Serving)[https://hexdocs.pm/nx/Nx.Serving.html]. A Serving allows us to run computations in batches, on remote computers with stronger GPUs etc.
+
+For our single string we don't need any of these advanced features, so we just run our `text_serving` with the query in this Livebook:
+
+```elixir
+query = "princess on horse"
+text_embedding = Nx.Serving.run(text_serving, query).embedding
+
+inspect(text_embedding)
+```
+
+### What did we do here?
+
+The code above creates a text encoding for "princess on horse" and converts it to a Nx Tensor with 512 dimensions.
+
+The _f32[512]_ notation in the output tells us that CLIP basically created an array with 512 floating numbers that represent a position in this multidimensional space.
+
+We can encode other text strings or images and compare their encoded tensors to our query for "princess on horse" (this is also how [RAG](https://en.wikipedia.org/wiki/Prompt_engineering#Retrieval-augmented_generation) works).
+
+We only encoded text string so far, so let's try images next:
+
+## Create image embeddings
+
+If you cloned this tutorial's Github repo you should have a /images folder with 40 images.
+
+You can also add additional images to to encode (and search).
+
+```elixir
+paths =
+  Path.wildcard("images/*.{webp}")
+  # reduce this number to encode fewer pics (faster)
+  |> Enum.take(40)
+```
+
+```elixir
+# processing the images in batches is faster
+# increase if you have a lot of RAM
+# decrease if your computer slows down when creating the embeddings in the next step
+batch_size = 8
+
+image_tensors =
+  paths
+  |> Stream.chunk_every(batch_size)
+  |> Stream.flat_map(fn chunk ->
+    Enum.map(chunk, &(Image.open!(&1) |> Image.to_nx!()))
+  end)
+  |> Enum.into([])
+```
+
+First, we'll use the [Image library](https://hexdocs.pm/image/Image.html) to convert each image to Nx tensors. This allows us to leverage Nx Machine Learning models.
+
+Next we create our image embeddings. The base CLIP vision model encodes each image tensor as a vector with 512 dimensions that we can in an index for our search.
+
+### Create the image embeddings
+
+The following looks very familiar to our text encoder above. We use the same model, the same model dimensions and in general the same process to encode images as tensor embeddings.
+However, there are a couple of differences:
+
+1. We use a different module `Bumblebee.Vision.ClipVision` instead of the text counterpart.
+2. We also add a batch size to our Nx Serving to speed up the encoding.
+
+**Note:** We process the images in batches of 8. If you experience slowdowns during the next step, try to reduce the the batch size.
+
+```elixir
+model = "openai/clip-vit-base-patch32"
+model_dimension = 512
+
+# model = "openai/clip-vit-large-patch14"
+# model_dimension = 768
+# batch_size = 2
+
+{:ok, clip} =
+  Bumblebee.load_model({:hf, model},
+    module: Bumblebee.Vision.ClipVision,
+    architecture: :for_embedding
+  )
+
+{:ok, featurizer} = Bumblebee.load_featurizer({:hf, model})
+
+image_serving =
+  Bumblebee.Vision.image_embedding(clip, featurizer,
+    compile: [batch_size: batch_size],
+    output_attribute: :embedding
+  )
+```
+
+```elixir
+embeddings =
+  image_tensors
+  |> Stream.chunk_every(batch_size)
+  |> Stream.flat_map(fn chunk ->
+    Nx.Serving.run(image_serving, chunk) |> Enum.map(& &1.embedding)
+  end)
+  |> Enum.into([])
+```
+
+```elixir
+embeddings |> List.first()
+```
+
+### What did we do here?
+
+We got a list of 40 Nx.Tensors, each with 512 floats that represent the vectors position in the model space.
+
+If we take the first image embedding it looks very similar to our text embedding in the previous section. They have the same encoding (dimensions) and we could manually calculate the cosine similarity to get a sense how similar a text query is to an image.
+
+We will do this in the next section with the help of an vector embedding index.
+
+## Store the vector embeddings in an index
+
+There are dedicated DBs out there as well as addons like [pgvector](https://github.com/pgvector/pgvector-elixir) for Postgres.
+
+We will use the Elixir binding for [HSWNLib](https://github.com/elixir-nx/hnswlib) that can store our vector embeddings.
+
+### Limitations
+
+Vector databases are fast because they normally only store ids and vectors/tensors/arrays. In a real app you'd have to find a way to sync the vector DB id with your app's DB id.
+
+In this example, we skip that and use `Enum.at(image_tensors, vector_db_id)` to get the right image from the index.
+
+### Cosine Similarity
+
+There are a couple of different ways to measure the similarity. We will use [cosine similarity](https://www.youtube.com/watch?v=zcUGLp5vwaQ) which gives us a value between -1 (completely different) and 1 (the same).
+
+Fortunately, HNSWLib comes with a function to retrieve the k nearest neighbors based on cosine similarity. Once we have an index of embeddings it is straightforward to compare them with a query.
+
+Let's start to create the index:
+
+```elixir
+# for the Base model, 768 for CLIP Large model
+model_dimension = 512
+# number of our images
+index_size = 40
+
+# create the index
+{:ok, index} = HNSWLib.Index.new(:cosine, model_dimension, index_size)
+
+# add each image embedding to the index
+Enum.each(embeddings, &HNSWLib.Index.add_items(index, &1))
+
+HNSWLib.Index.get_current_count(index)
+```
+
+We now have a HNSWLib index with 40 embeddings. This is everything we need to retrieve images based on a query.
+
+## Querying our vector embeddings index
+
+An overview of our search process looks like this:
+
+1. Encode a string as a text embedding.
+2. Compare this embedding with the image embeddings in our index.
+3. Fetch the k most similar image embeddings from the index.
+4. Use the the image embeddings to get the images from our images list.
+
+For step 1 we need our CLIP text encoder from the beginning again. Each time we want to compare a text with the images in our index we need to compute a text embedding.
+
+Let's load our CLIP text encoder once again:
+
+```elixir
+model = "openai/clip-vit-base-patch32"
+model_dimension = 512
+
+## or try the bigger, more accurate model:
+# model = "openai/clip-vit-large-patch14"
+# model_dimension = 768
+# batch_size = 2
+
+# use CLIP text encoder
+{:ok, clip_text} =
+  Bumblebee.load_model({:hf, model},
+    module: Bumblebee.Text.ClipText,
+    architecture: :for_embedding
+  )
+
+# create a Nx Serving to encode text strings
+{:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, model})
+text_serving = Bumblebee.Text.text_embedding(clip_text, tokenizer, output_attribute: :embedding)
+```
+
+Now we are ready to search our index for the 4 most similar images:
+
+```elixir
+query = "a knight on a boat"
+# encode our query
+text_embedding = Nx.Serving.run(text_serving, query).embedding
+
+# get the 4 most similar image embeddings in our index based on cosine similarity
+{:ok, results, weights} = HNSWLib.Index.knn_query(index, text_embedding, k: 4)
+
+results =
+  results
+  |> Nx.to_flat_list()
+
+weights =
+  weights
+  |> Nx.to_flat_list()
+
+Enum.zip(results, weights)
+```
+
+### What happened here?
+
+The `HNSWLib.knn_query/3` function returns a list of index ids and their weights. If you use my image folder you should see a list of 4 entries like this:
+
+```bash
+[
+  {26, 0.7112932205200195},
+    {28, 0.7251952886581421},
+      {29, 0.7263988256454468},
+        {27, 0.774106502532959}
+        ]
+```
+
+The first element is the id and the second element is the weight based on cosine similarity. The **lower** this value, the **more similar** an image is to our query.
+
+## Finished AI Image Search
+
+We can put the pieces together to get a working image search based on embeddings and some AI magic:
+
+```elixir
+input = Kino.Input.text("Image Search", default: "a camel") |> Kino.render()
+query = Kino.Input.read(input)
+
+# encode our query
+text_embedding = Nx.Serving.run(text_serving, query).embedding
+
+# get the 4 most similar image embeddings in our index based on cosine similarity
+{:ok, results, weights} = HNSWLib.Index.knn_query(index, text_embedding, k: 4)
+
+results =
+  results
+  |> Nx.to_flat_list()
+
+weights =
+  weights
+  |> Nx.to_flat_list()
+
+# use the index id to get the right image_tensors from above
+# convert the tensors into images that we can render
+results
+|> Enum.map(fn idx -> Enum.at(image_tensors, idx) |> Image.from_nx!() end)
+|> Enum.zip(weights)
+|> Enum.map(fn {img, weights} ->
+  Image.Kino.show(img) |> Kino.render()
+  Kino.Text.new("Weight: " <> Float.to_string(weights)) |> Kino.render()
+end)
+```
+
+## Bonus: How to use HNSWLib in a real app
+
+In one of my apps I currently use a Genserver to load HNSWLib when starting and keep the ids, index size etc. in sync with image paths in my database.
+
+I haven't looked into vector addons for Sqlite & Postgres but I would expect them to be more stable than my current approach.
+
+Anyway, if you want to leverage your knowledge from this tutorial, HNSWLib might be the fastest way to get something working.
